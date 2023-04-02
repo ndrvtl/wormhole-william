@@ -212,6 +212,8 @@ func (t *fileTransport) connectViaRelay(otherTransit *transitMsg) (net.Conn, err
 	return conn, nil
 }
 
+var directConnectTimeout = 5 * time.Second
+
 func (t *fileTransport) connectDirect(otherTransit *transitMsg) (net.Conn, error) {
 	cancelFuncs := make(map[string]func())
 
@@ -222,10 +224,16 @@ func (t *fileTransport) connectDirect(otherTransit *transitMsg) (net.Conn, error
 
 	for _, hint := range otherTransit.HintsV1 {
 		if hint.Type == "direct-tcp-v1" {
-			count++
-			ctx, cancel := context.WithCancel(context.Background())
 			addr := net.JoinHostPort(hint.Hostname, strconv.Itoa(hint.Port))
 
+			if _, exists := cancelFuncs[addr]; exists {
+				// if the other peer sends multiple hints for the same address, only attempt
+				// one connection
+				continue
+			}
+
+			count++
+			ctx, cancel := context.WithCancel(context.Background())
 			cancelFuncs[addr] = cancel
 
 			go t.connectToSingleHost(ctx, addr, successChan, failChan)
@@ -234,7 +242,7 @@ func (t *fileTransport) connectDirect(otherTransit *transitMsg) (net.Conn, error
 
 	var conn net.Conn
 
-	connectTimeout := time.After(5 * time.Second)
+	connectTimeout := time.After(directConnectTimeout)
 
 	for i := 0; i < count; i++ {
 		select {
@@ -244,6 +252,8 @@ func (t *fileTransport) connectDirect(otherTransit *transitMsg) (net.Conn, error
 			for _, cancel := range cancelFuncs {
 				cancel()
 			}
+			// increment the count to make sure we consume all pending writes to the fail channel
+			count++
 		}
 	}
 
@@ -605,20 +615,25 @@ func (t *fileTransport) handleIncomingConnection(conn net.Conn, readyCh chan<- n
 	}
 }
 
-func nonLocalhostAddresses() []string {
+var nonLocalhostAddresses = func() []string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return nil
 	}
 
-	var outAddrs []string
+	dedupAddrs := make(map[string]struct{})
 
 	for _, a := range addrs {
 		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 			if ipnet.IP.To4() != nil {
-				outAddrs = append(outAddrs, ipnet.IP.String())
+				dedupAddrs[ipnet.IP.String()] = struct{}{}
 			}
 		}
+	}
+
+	outAddrs := make([]string, 0, len(dedupAddrs))
+	for addr := range dedupAddrs {
+		outAddrs = append(outAddrs, addr)
 	}
 
 	return outAddrs
